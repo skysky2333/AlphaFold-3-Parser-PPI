@@ -9,7 +9,7 @@
   - One aggregate CSV across all runs: one row per run summarizing counts and extremes.
 
 ## To Run:
-- `python SCRIPTS_PPIXLS/af3/parse_af3_runs.py <input_dir> [--distance_cutoff 6.0] [--pae_cutoff 8.0] [--contact_prob_threshold 0.5] [--output_dir <dir>]`
+- `python parse_af3_runs.py <input_dir> [--distance_cutoff 6.0] [--pae_cutoff 8.0] [--contact_prob_threshold 0.5] [--output_dir <dir>]`
 
 ## Inputs
 - `input_dir`: directory containing multiple AF3 run subfolders. It can be ran directly on the AF3 server downloaded outputs.
