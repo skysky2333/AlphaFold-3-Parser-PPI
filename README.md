@@ -48,3 +48,6 @@
 - Minimal distances are computed over all heavy‑atom pairs between residues
 - PAE gating uses the average of `PAE[i,j]` and `PAE[j,i]` from the AF3 full JSON.
 - Residue‑level distances are computed only for standard amino acids parsed from the CIF.
+
+## Ackonwledgement
+The code is created with the help of Codex from OpenAI.
