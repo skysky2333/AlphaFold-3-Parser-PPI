@@ -35,11 +35,10 @@ import numpy as np
 import pandas as pd
 
 try:
-    from Bio.PDB import MMCIFParser, NeighborSearch
+    from Bio.PDB import MMCIFParser
     from Bio.PDB.Polypeptide import is_aa
 except Exception as e:  # pragma: no cover - allow import on machines without BioPython during static reading
     MMCIFParser = None  # type: ignore
-    NeighborSearch = None  # type: ignore
     def is_aa(residue, standard: bool = False) -> bool:  # type: ignore
         return False
 
@@ -109,11 +108,6 @@ def _base_prefix(run_dir: str) -> str:
         if fn.endswith(".cif") and "_model_" in fn:
             return fn.rsplit("_model_", 1)[0]
     raise FileNotFoundError(f"Cannot determine base prefix in {run_dir}")
-
-
-def _safe_mean(arr: Iterable[float]) -> float:
-    arr = list(arr)
-    return float(np.mean(arr)) if arr else float("nan")
 
 
 def _sym_pae(pae: np.ndarray, i: int, j: int) -> float:
@@ -247,245 +241,7 @@ def build_token_map(full_json: dict) -> TokenMap:
     return TokenMap(token_chain=token_chain, token_resid=list(map(int, token_resid)), resid_to_token=resid_to_token, chain_to_token_idxs=chain_to_token_idxs)
 
 
-# ------------- Metrics computation (previous classes kept for reference, not used in final outputs) -------------
-
-@dataclass
-class ModelMetrics:
-    run_name: str
-    model_index: int
-    chains: str  # e.g. "A,B"
-    chain_lengths: str  # e.g. "A:464,B:638"
-    ptm: float
-    iptm: float
-    fraction_disordered: float
-    has_clash: int
-    ranking_score: float
-    min_raw_distance: float
-    min_confident_distance: float
-    num_contacts_distance_only: int
-    num_contacts_confident: int
-    residues_with_conf_contacts_A: int
-    residues_with_conf_contacts_B: int
-    fraction_cross_pairs_confident: float
-    max_contact_prob_cross: float
-    max_contact_prob_confident: float
-
-
-@dataclass
-class ChainPairMetrics:
-    run_name: str
-    model_index: int
-    chain_i: str
-    chain_j: str
-    chain_pair_pae_min: float
-    chain_pair_iptm: float
-    num_contacts_distance_only: int
-    num_contacts_confident: int
-    min_raw_distance: float
-    min_confident_distance: float
-    max_contact_prob_cross: float
-    max_contact_prob_confident: float
-
-
-@dataclass
-class TopPair:
-    run_name: str
-    model_index: int
-    chain_i: str
-    resid_i: int
-    chain_j: str
-    resid_j: int
-    min_distance: float
-    pae_avg: float
-    contact_prob: float
-
-
-def compute_metrics_for_model(
-    run_name: str,
-    model_index: int,
-    summary: dict,
-    full: dict,
-    cif_path: str,
-    dist_cutoff: float,
-    pae_cutoff: float,
-    contact_prob_threshold: float,
-    top_pairs_k: int,
-) -> Tuple[ModelMetrics, List[ChainPairMetrics], List[TopPair]]:
-    # Parse CIF and tokens
-    atoms, res_to_atom_idxs = load_cif_atoms(cif_path)
-    tmap = build_token_map(full)
-
-    # Arrays
-    pae = np.array(full.get("pae"), dtype=float)
-    cprob = np.array(full.get("contact_probs"), dtype=float)
-
-    # Chain info
-    chain_ids = sorted(set(tmap.token_chain))
-    chain_lengths_str = ",".join(f"{c}:{int((tmap.chain_to_token_idxs[c]).size)}" for c in chain_ids)
-
-    # Compute cross-chain masks for all pairs and by chain pair
-    chain_pair_metrics: List[ChainPairMetrics] = []
-    top_pairs: List[TopPair] = []
-    min_raw_distance_run = math.inf
-    min_confident_distance_run = math.inf
-    contacts_distance_only_total = 0
-    contacts_confident_total = 0
-    residues_conf_A: set[int] = set()
-    residues_conf_B: set[int] = set()
-
-    # We'll assume up to 5 chains generality; but focus on pairwise cross chains
-    # For this dataset, we saw ['A','B']
-    # Compute chain-pair metrics for all ordered pairs (i != j)
-    for i_idx, ci in enumerate(chain_ids):
-        for j_idx, cj in enumerate(chain_ids):
-            if ci == cj:
-                continue
-            ti = tmap.chain_to_token_idxs[ci]
-            tj = tmap.chain_to_token_idxs[cj]
-            # Cross submatrices
-            pae_sub = (pae[np.ix_(ti, tj)] + pae[np.ix_(tj, ti)].T) * 0.5
-            cprob_sub = cprob[np.ix_(ti, tj)]
-
-            # Confidence mask and stats
-            conf_mask = pae_sub <= pae_cutoff
-            fraction_confident = float(np.sum(conf_mask)) / float(conf_mask.size) if conf_mask.size > 0 else float("nan")
-
-            # Contact prob maxima
-            max_cprob_cross = float(np.max(cprob_sub)) if cprob_sub.size else float("nan")
-            try:
-                max_cprob_conf = float(np.max(cprob_sub[conf_mask])) if np.any(conf_mask) else float("nan")
-            except ValueError:
-                max_cprob_conf = float("nan")
-
-            # Geometry contacts within cutoff for this chain pair
-            contacts_map = contact_residue_pairs(atoms, res_to_atom_idxs, ci, cj, dist_cutoff)
-            num_contacts_distance_only = len(contacts_map)
-
-            # For confident contacts, keep only those whose token-level PAE passes
-            num_contacts_confident = 0
-            min_raw_distance_local = math.inf
-            min_confident_distance_local = math.inf
-
-            # Build resid->token maps for speed
-            def tok(chain: str, resid: int) -> Optional[int]:
-                return tmap.resid_to_token.get((chain, int(resid)))
-
-            for (ra, rb), d in contacts_map.items():
-                # Update min raw distance
-                if d < min_raw_distance_local:
-                    min_raw_distance_local = d
-                ta = tok(ci, ra)
-                tb = tok(cj, rb)
-                if ta is None or tb is None:
-                    continue
-                pae_avg = _sym_pae(pae, ta, tb)
-                if pae_avg <= pae_cutoff:
-                    num_contacts_confident += 1
-                    if d < min_confident_distance_local:
-                        min_confident_distance_local = d
-                    if ci == 'A':
-                        residues_conf_A.add(ra)
-                        residues_conf_B.add(rb)
-                    elif ci == 'B':
-                        residues_conf_A.add(rb)
-                        residues_conf_B.add(ra)
-
-            # Update run aggregates
-            contacts_distance_only_total += num_contacts_distance_only
-            contacts_confident_total += num_contacts_confident
-            if min_raw_distance_local < min_raw_distance_run:
-                min_raw_distance_run = min_raw_distance_local
-            if min_confident_distance_local < min_confident_distance_run:
-                min_confident_distance_run = min_confident_distance_local
-
-            # Summary arrays from summary_confidences_* where available
-            cppi = float("nan")
-            cpip = float("nan")
-            chain_pair_pae_min = summary.get("chain_pair_pae_min")
-            chain_pair_iptm = summary.get("chain_pair_iptm")
-            chain_index_map = {c: idx for idx, c in enumerate(chain_ids)}
-            if isinstance(chain_pair_pae_min, list):
-                try:
-                    cppi = float(chain_pair_pae_min[chain_index_map[ci]][chain_index_map[cj]])
-                except Exception:
-                    pass
-            if isinstance(chain_pair_iptm, list):
-                try:
-                    cpip = float(chain_pair_iptm[chain_index_map[ci]][chain_index_map[cj]])
-                except Exception:
-                    pass
-
-            chain_pair_metrics.append(
-                ChainPairMetrics(
-                    run_name=run_name,
-                    model_index=model_index,
-                    chain_i=ci,
-                    chain_j=cj,
-                    chain_pair_pae_min=cppi,
-                    chain_pair_iptm=cpip,
-                    num_contacts_distance_only=num_contacts_distance_only,
-                    num_contacts_confident=num_contacts_confident,
-                    min_raw_distance=(min_raw_distance_local if min_raw_distance_local != math.inf else float("nan")),
-                    min_confident_distance=(min_confident_distance_local if min_confident_distance_local != math.inf else float("nan")),
-                    max_contact_prob_cross=max_cprob_cross,
-                    max_contact_prob_confident=max_cprob_conf,
-                )
-            )
-
-            # Top residue pairs by either smallest distance or highest contact_probs among confident pairs
-            # Build candidate list
-            candidates: List[TopPair] = []
-            if contacts_map:
-                # Evaluate each contact residue pair
-                for (ra, rb), d in contacts_map.items():
-                    ta = tok(ci, ra)
-                    tb = tok(cj, rb)
-                    if ta is None or tb is None:
-                        continue
-                    pae_avg = _sym_pae(pae, ta, tb)
-                    cp = float(cprob[ta, tb])
-                    candidates.append(TopPair(
-                        run_name=run_name,
-                        model_index=model_index,
-                        chain_i=ci,
-                        resid_i=int(ra),
-                        chain_j=cj,
-                        resid_j=int(rb),
-                        min_distance=float(d),
-                        pae_avg=float(pae_avg),
-                        contact_prob=cp,
-                    ))
-            # Select top K: prioritize confident and then by distance, then by contact_prob
-            candidates.sort(key=lambda t: (t.pae_avg <= pae_cutoff, -t.contact_prob, -float('inf') if math.isnan(t.min_distance) else -t.min_distance), reverse=True)
-            top_pairs.extend(candidates[:top_pairs_k])
-
-    # Model-level metrics
-    chains_str = ",".join(chain_ids)
-    model_metrics = ModelMetrics(
-        run_name=run_name,
-        model_index=model_index,
-        chains=chains_str,
-        chain_lengths=chain_lengths_str,
-        ptm=float(summary.get("ptm", float("nan"))),
-        iptm=float(summary.get("iptm", float("nan"))),
-        fraction_disordered=float(summary.get("fraction_disordered", float("nan"))),
-        has_clash=int(summary.get("has_clash", 0)),
-        ranking_score=float(summary.get("ranking_score", float("nan"))),
-        min_raw_distance=(min_raw_distance_run if min_raw_distance_run != math.inf else float("nan")),
-        min_confident_distance=(min_confident_distance_run if min_confident_distance_run != math.inf else float("nan")),
-        num_contacts_distance_only=int(contacts_distance_only_total),
-        num_contacts_confident=int(contacts_confident_total),
-        residues_with_conf_contacts_A=len(residues_conf_A),
-        residues_with_conf_contacts_B=len(residues_conf_B),
-        fraction_cross_pairs_confident=_safe_mean([
-            float(np.sum((pae[np.ix_(tmap.chain_to_token_idxs[chain_ids[0]], tmap.chain_to_token_idxs[chain_ids[1]])] + pae[np.ix_(tmap.chain_to_token_idxs[chain_ids[1]], tmap.chain_to_token_idxs[chain_ids[0]])].T) * 0.5 <= pae_cutoff))
-            / float(len(tmap.chain_to_token_idxs[chain_ids[0]]) * len(tmap.chain_to_token_idxs[chain_ids[1]]))
-        ]) if len(chain_ids) >= 2 else float('nan'),
-        max_contact_prob_cross=float(np.max(cprob)) if cprob.size else float("nan"),
-        max_contact_prob_confident=float(np.max(cprob[(pae + pae.T) * 0.5 <= pae_cutoff])) if cprob.size else float("nan"),
-    )
-
-    return model_metrics, chain_pair_metrics, top_pairs
+# (intentionally left blank — previous unused metrics/model code removed)
 
 
 def _choose_best_model_index(run_dir: str, base: str) -> Optional[int]:
@@ -705,12 +461,7 @@ def parse_run_best_model(
     return run_name, best_idx, agg, interaction_rows
 
 
-def aggregate_best_by_ranking(model_metrics: List[ModelMetrics]) -> Optional[ModelMetrics]:
-    if not model_metrics:
-        return None
-    # Higher ranking_score is better
-    best = max(model_metrics, key=lambda m: (m.ranking_score, -m.min_confident_distance if not math.isnan(m.min_confident_distance) else math.inf))
-    return best
+# (intentionally left blank — removed unused aggregate helper)
 
 
 def main():
